@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<meta name="referrer" content="no-referrer">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<!-- This page may talk to Microsoft sign-in and Microsoft Graph only. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src https://login.microsoftonline.com https://graph.microsoft.com; worker-src 'self'; form-action 'none'; base-uri 'none'">
+<title>Sign-in Test</title>
+<style>
+  :root { color-scheme: dark; --bg:#111417; --panel:#1b2025; --line:#39424b; --text:#eef2f5; --dim:#a3afb9; --go:#e8b04a; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.45 -apple-system, system-ui, sans-serif; padding: max(16px, env(safe-area-inset-top)) 16px 24px; }
+  main { max-width: 900px; margin: 0 auto; display: grid; gap: 12px; }
+  h1 { font-size: 22px; margin: 0; } h2 { font-size: 18px; margin: 10px 0 0; } p { margin: 0; color: var(--dim); }
+  .row { display:flex; flex-wrap:wrap; gap:10px; }
+  label { display:grid; gap:4px; font-size:14px; color:var(--dim); }
+  input, button { font:inherit; min-height:48px; padding:10px 14px; border-radius:10px; border:1px solid var(--line); background:var(--panel); color:var(--text); max-width:100%; }
+  input { width:100%; } button { cursor:pointer; } button:disabled { opacity:.4; }
+  button.go { background:var(--go); border-color:var(--go); color:#1a1204; font-weight:700; }
+  .info { font:14px/1.5 ui-monospace, Menlo, monospace; background:var(--panel); padding:10px 12px; border-radius:10px; overflow-wrap:anywhere; white-space:pre-wrap; }
+  #say { min-height:1.5em; color:var(--text); } #say.err { color:#ff9b8f; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Sign-in Test</h1>
+  <p>Test accounts and test data only. Setup, sign-in and the photo stay on this device, except what is sent to Microsoft.</p>
+  <div id="state" class="info">Starting...</div>
+  <p id="say" role="status"></p>
+
+  <h2>Setup</h2>
+  <label>Application (client) ID <input id="client" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+  <label>Directory (tenant) domain or ID <input id="tenant" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+  <label>Test site address <input id="site" inputmode="url" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+  <label>Another site this user can open in the browser (must be refused here) <input id="other" inputmode="url" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+  <div class="row"><button id="save" type="button">Save setup</button></div>
+
+  <h2>1. Photo on the device</h2>
+  <label>Pick or take a test photo <input id="pick" type="file" accept="image/*"></label>
+  <div class="row"><button id="checkPhoto" type="button">Check stored photo</button></div>
+
+  <h2>2. Sign in</h2>
+  <div class="row">
+    <button id="signin" class="go" type="button">Sign in with Microsoft</button>
+    <button id="renew" type="button">Renew quietly</button>
+    <button id="forget" type="button">Forget sign-in on this device</button>
+  </div>
+
+  <h2>3. Tests</h2>
+  <div class="row">
+    <button data-t="reach" type="button">Reach test site</button>
+    <button data-t="other" type="button">Reach other site</button>
+    <button data-t="upload" type="button">Upload stored photo</button>
+  </div>
+  <div class="row">
+    <button data-t="addLock" type="button">Add lock</button>
+    <button data-t="editLock" type="button">Edit other user's lock</button>
+    <button data-t="delLock" type="button">Delete other user's lock</button>
+    <button data-t="delMine" type="button">Delete my lock</button>
+  </div>
+
+  <h2>Results</h2>
+  <p>No names, tokens, site addresses or IDs are written here.</p>
+  <div id="log" class="info"></div>
+  <div class="row"><button id="clearLog" type="button">Clear results</button></div>
+</main>
+<script>
+(() => {
+  'use strict';
+  const LOGIN = 'https://login.microsoftonline.com', GRAPH = 'https://graph.microsoft.com/v1.0';
+  const SCOPE = 'openid profile offline_access https://graph.microsoft.com/Sites.Selected';
+  const VIN = 'TESTVIN0000000002', FOLDER = 'TEST02_' + VIN;
+  const $ = id => document.getElementById(id);
+  const K = 'signin-test:';
+  const get = k => { try { return JSON.parse(localStorage.getItem(K + k)); } catch (e) { return null; } };
+  const set = (k, v) => localStorage.setItem(K + k, JSON.stringify(v));
+  const del = k => localStorage.removeItem(K + k);
+  const say = (m, err) => { $('say').textContent = m; $('say').className = err ? 'err' : ''; };
+  const showLog = () => { $('log').textContent = (get('log') || []).join('\n') || 'Nothing yet.'; };
+  const log = m => { const l = get('log') || []; l.push(new Date().toLocaleString() + '  ' + m); set('log', l.slice(-80)); showLog(); };
+  const home = () => navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
+  const back = location.origin + location.pathname;
+  const b64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const random = () => b64(crypto.getRandomValues(new Uint8Array(32)));
+  const claims = t => { try { return JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0)))); } catch (e) { return {}; } };
+  class Stop extends Error {}
+
+  // ---- setup ----
+  const fields = ['client', 'tenant', 'site', 'other'];
+  function cfg() {
+    const c = get('cfg') || {};
+    if (!/^[0-9a-f-]{36}$/i.test(c.client || '') || !/^[a-z0-9.-]+$/i.test(c.tenant || '')) throw new Stop('Fill in the client ID and tenant, then Save setup.');
+    return c;
+  }
+  function sitePath(address) {
+    let u;
+    try { u = new URL(/^https:\/\//i.test(address) ? address : 'https://' + address); } catch (e) { throw new Stop('That site address is not readable.'); }
+    const m = u.pathname.match(/^\/(sites|teams)\/[^/]+/i);
+    if (!/\.sharepoint\.com$/i.test(u.hostname) || !m) throw new Stop('Use a SharePoint address like https://company.sharepoint.com/sites/Name');
+    return u.hostname + ':' + m[0];
+  }
+
+  // ---- sign-in: authorization code with PKCE, full-page redirect, no secret ----
+  async function signIn() {
+    const c = cfg(), verifier = random(), state = random();
+    const challenge = b64(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+    set('pending', { verifier, state, at: Date.now() });
+    log('Sign-in started from ' + (home() ? 'Home Screen' : 'browser tab'));
+    location.assign(LOGIN + '/' + c.tenant + '/oauth2/v2.0/authorize?' + new URLSearchParams({
+      client_id: c.client, response_type: 'code', redirect_uri: back, response_mode: 'query', scope: SCOPE,
+      state, code_challenge: challenge, code_challenge_method: 'S256' }));
+  }
+  // Microsoft's full error text can contain IDs, so only its short code is kept.
+  const code = t => ((String(t || '').match(/AADSTS\d+/) || [])[0]) || String(t || 'unknown').split(/[\s:]/)[0].slice(0, 40);
+  async function token(body) {
+    const c = cfg();
+    const r = await fetch(LOGIN + '/' + c.tenant + '/oauth2/v2.0/token', { method: 'POST', body: new URLSearchParams({ client_id: c.client, scope: SCOPE, ...body }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Stop('Microsoft refused the token: ' + code(j.error_description || j.error));
+    const old = get('tok') || {};
+    set('tok', { access: j.access_token, refresh: j.refresh_token || old.refresh, until: Date.now() + (j.expires_in - 120) * 1000,
+      who: j.id_token ? claims(j.id_token) : old.who, signedIn: body.grant_type === 'authorization_code' ? Date.now() : old.signedIn });
+  }
+  async function finishSignIn() {
+    const q = new URLSearchParams(location.search);
+    if (!q.has('code') && !q.has('error')) return;
+    history.replaceState(null, '', back);
+    const p = get('pending'); del('pending');
+    log('Returned from Microsoft in ' + (home() ? 'Home Screen' : 'browser tab') + (p ? ' after ' + Math.round((Date.now() - p.at) / 1000) + ' s' : ''));
+    if (!p || p.state !== q.get('state')) { log('FAIL: saved sign-in state missing or different. It may have returned in a different window.'); throw new Stop('Sign-in came back without its saved state.'); }
+    if (q.has('error')) { log('FAIL: Microsoft returned ' + code(q.get('error_description') || q.get('error'))); throw new Stop('Sign-in was not completed.'); }
+    await token({ grant_type: 'authorization_code', code: q.get('code'), redirect_uri: back, code_verifier: p.verifier });
+    log('PASS: signed in');
+  }
+  async function renew() {
+    const t = get('tok'); if (!t || !t.refresh) throw new Stop('Not signed in.');
+    const age = ((Date.now() - t.signedIn) / 3600000).toFixed(1);
+    try { await token({ grant_type: 'refresh_token', refresh_token: t.refresh }); log('Quiet renewal worked, ' + age + ' h after sign-in'); }
+    catch (e) { log('Quiet renewal failed, ' + age + ' h after sign-in'); throw e; }
+  }
+  async function access() {
+    const t = get('tok'); if (!t) throw new Stop('Sign in first.');
+    if (Date.now() > t.until) await renew();
+    return get('tok').access;
+  }
+
+  // ---- Microsoft Graph ----
+  async function graph(method, path, body, type) {
+    const h = { Authorization: 'Bearer ' + await access() };
+    if (body) h['Content-Type'] = type || 'application/json';
+    const r = await fetch(GRAPH + path, { method, headers: h, body: body && !type ? JSON.stringify(body) : body });
+    const j = r.status === 204 ? {} : await r.json().catch(() => ({}));
+    return { ok: r.ok, status: r.status, code: (j.error && j.error.code) || '', j };
+  }
+  const http = r => 'HTTP ' + r.status + (r.code ? ' ' + r.code : '');
+  const must = (r, what) => { if (!r.ok) throw new Stop(what + ': ' + http(r)); return r.j; };
+  const siteCall = which => graph('GET', '/sites/' + sitePath(cfg()[which] || '') + '?$select=id');
+  const siteId = async () => must(await siteCall('site'), 'Test site not reachable').id;
+  async function named(id, kind, name) {
+    const all = must(await graph('GET', '/sites/' + id + '/' + kind + '?$select=id,' + (kind === 'drives' ? 'name' : 'displayName')), 'Could not read ' + kind).value || [];
+    const f = all.find(x => (x.name || x.displayName) === name);
+    if (!f) throw new Stop('"' + name + '" not found on the test site');
+    return f.id;
+  }
+  const oid = () => ((get('tok') || {}).who || {}).oid;
+  const maker = i => ((i.createdBy || {}).user || {}).id;
+  async function locks() {
+    if (!oid()) throw new Stop('Sign in first.');
+    const s = await siteId(), l = await named(s, 'lists', 'Vehicle Locks'), base = '/sites/' + s + '/lists/' + l;
+    const col = (must(await graph('GET', base + '/columns?$select=name,displayName'), 'Could not read columns').value || []).find(c => c.displayName === 'VIN');
+    if (!col) throw new Stop('No VIN column found');
+    const all = must(await graph('GET', base + '/items?$expand=fields&$top=200'), 'Could not read locks').value || [];
+    // Only test rows with a known maker can ever be touched.
+    const items = all.filter(i => String((i.fields || {})[col.name] || '').startsWith('TESTVIN') && maker(i));
+    return { base, col: col.name, own: items.filter(i => maker(i) === oid()), others: items.filter(i => maker(i) !== oid()) };
+  }
+  const expectRefused = (what, r) => log((r.ok ? 'FAIL: ' + what + ' WENT THROUGH' : r.status === 403 ? 'PASS: ' + what + ' refused' : 'CHECK: ' + what + ' failed another way') + ' (' + http(r) + ')');
+  const other = l => { if (!l.others.length) throw new Stop('No test lock made by another user.'); return l.base + '/items/' + l.others[0].id; };
+
+  const tests = {
+    async reach() { const r = await siteCall('site'); log('Test site: ' + (r.ok ? 'reachable' : 'not reachable') + ' (' + http(r) + ')'); },
+    async other() { expectRefused('Other site', await siteCall('other')); },
+    async upload() {
+      const f = await photo(); if (!f) throw new Stop('Pick a photo first.');
+      const d = await named(await siteId(), 'drives', 'Vehicle Photos'), t0 = Date.now();
+      const up = await graph('PUT', '/drives/' + d + '/root:/' + FOLDER + '/TEST02_' + t0 + '.jpg:/content?@microsoft.graph.conflictBehavior=fail', f.blob, 'image/jpeg');
+      if (!up.ok) return log('FAIL: upload (' + http(up) + ')');
+      const seen = await graph('GET', '/drives/' + d + '/items/' + up.j.id + '?$select=size');
+      log((seen.ok && seen.j.size === f.size ? 'PASS' : 'FAIL') + ': uploaded ' + f.size + ' bytes, SharePoint reports ' + (seen.ok ? seen.j.size : http(seen)) + ', ' + ((Date.now() - t0) / 1000).toFixed(1) + ' s');
+    },
+    async addLock() {
+      const l = await locks(), row = { Title: VIN }; row[l.col] = VIN;
+      const r = await graph('POST', l.base + '/items', { fields: row });
+      log('Add lock: ' + (r.ok ? 'added' : 'not added') + ' (' + http(r) + ')');
+    },
+    async editLock() { expectRefused("Edit other user's lock", await graph('PATCH', other(await locks()) + '/fields', { Title: 'edited by test' })); },
+    async delLock() { expectRefused("Delete other user's lock", await graph('DELETE', other(await locks()))); },
+    async delMine() {
+      const l = await locks(); if (!l.own.length) throw new Stop('You have no test lock.');
+      const r = await graph('DELETE', l.base + '/items/' + l.own[0].id);
+      log('Delete my lock: ' + (r.ok ? 'deleted' : 'not deleted') + ' (' + http(r) + ')');
+    }
+  };
+
+  // ---- one stored photo ----
+  const openDb = () => new Promise((ok, no) => {
+    const r = indexedDB.open('signin-test', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('photo');
+    r.onsuccess = () => ok(r.result); r.onerror = () => no(r.error);
+  });
+  async function store(mode, fn) {
+    const d = await openDb();
+    try {
+      return await new Promise((ok, no) => {
+        const t = d.transaction('photo', mode), r = fn(t.objectStore('photo'));
+        t.oncomplete = () => ok(r.result); t.onabort = t.onerror = () => no(t.error || r.error);
+      });
+    } finally { d.close(); }
+  }
+  const photo = () => store('readonly', s => s.get('p'));
+  const hash = async b => b64(await crypto.subtle.digest('SHA-256', await b.arrayBuffer()));
+  async function checkPhoto() {
+    const f = await photo();
+    if (!f) return log(get('hadPhoto') ? 'FAIL: stored photo is gone' : 'No photo stored yet');
+    log(f.blob.size === f.size && await hash(f.blob) === f.hash ? 'PASS: stored photo intact' : 'FAIL: stored photo damaged');
+  }
+  async function keepPhoto(b) {
+    const h = await hash(b);
+    await store('readwrite', s => s.put({ blob: b, size: b.size, hash: h }, 'p'));
+    set('hadPhoto', true);
+    await checkPhoto();
+  }
+
+  // ---- page ----
+  function show() {
+    const t = get('tok'), who = t && t.who ? (t.who.preferred_username || t.who.name || 'unknown') : '';
+    $('state').textContent = 'Opened from: ' + (home() ? 'Home Screen' : 'browser tab') + '\nSigned in: ' + (t ? who + ', since ' + new Date(t.signedIn).toLocaleString() : 'no') +
+      '\nRedirect address to register: ' + back;
+    $('renew').disabled = $('forget').disabled = !t;
+  }
+  let busy = false;
+  async function go(fn, done) {
+    if (busy) return;
+    busy = true; document.querySelectorAll('button').forEach(b => { b.disabled = true; }); say('Working...');
+    try { await fn(); say(done || 'Done. See Results.'); }
+    catch (e) { const m = e instanceof Stop ? e.message : 'Problem: ' + (e.name || 'error') + (e.name === 'TypeError' ? ' (network or blocked)' : ''); say(m, true); log(m); }
+    finally { busy = false; document.querySelectorAll('button').forEach(b => { b.disabled = false; }); show(); }
+  }
+  const saved = get('cfg') || {};
+  fields.forEach(f => { $(f).value = saved[f] || ''; });
+  $('save').onclick = () => go(async () => {
+    const c = {}; fields.forEach(f => { c[f] = $(f).value.trim(); });
+    set('cfg', c); cfg(); sitePath(c.site); if (c.other) sitePath(c.other);
+  }, 'Setup saved on this device.');
+  $('pick').onchange = e => { const b = e.target.files[0]; if (b) go(() => keepPhoto(b)); };
+  $('checkPhoto').onclick = () => go(checkPhoto);
+  $('signin').onclick = () => go(signIn, 'Going to Microsoft...');
+  $('renew').onclick = () => go(renew);
+  $('forget').onclick = () => go(async () => { del('tok'); del('pending'); log('Sign-in forgotten on this device'); });
+  $('clearLog').onclick = () => { del('log'); showLog(); };
+  document.querySelectorAll('[data-t]').forEach(b => { b.onclick = () => go(tests[b.dataset.t]); });
+  showLog(); show();
+  go(finishSignIn, 'Ready.');
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+})();
+</script>
+</body>
+</html>
